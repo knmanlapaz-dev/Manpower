@@ -924,19 +924,86 @@
 
 		const cleanColumns = headers => { const used = new Set(); return headers.map((header, index) => { const base = String(header ?? '').trim() || `Column ${index + 1}`; let name = base, suffix = 2; while (used.has(name)) name = `${base} (${suffix++})`; used.add(name); return name; }); };
 		const matchHeaderColumns = headerRow => { const claimed = new Set(); const cells = headerRow.map((header, index) => ({ header, index, standard: null })); const isOldEmpId = header => /^old\s+emp\s*#?$/i.test(String(header ?? '').trim()); cells.forEach(cell => { if (String(cell.header ?? '').trim() === '' || isOldEmpId(cell.header)) return; const match = defaultColumns.find(column => !claimed.has(column) && normalizeHeader(column) === normalizeHeader(cell.header)); if (match) { cell.standard = match; claimed.add(match); } }); cells.forEach(cell => { if (cell.standard || String(cell.header ?? '').trim() === '' || isOldEmpId(cell.header)) return; const normalizedHeader = normalizeHeader(cell.header); const candidates = defaultColumns.filter(column => !claimed.has(column) && (normalizedHeader.includes(normalizeHeader(column)) || normalizeHeader(column).includes(normalizedHeader))); if (candidates.length === 1) { cell.standard = candidates[0]; claimed.add(candidates[0]); } }); return cells.filter(cell => cell.standard); };
-		// Shared by the file-picker import and the Google Sheets API import below —
-		// `matrix` is a header-row + data-rows array, whichever source it came from.
+		// Shared by the file-picker import and the Google Sheets API import below.
+		// The source sheet can contain title rows, summary cells, repeated labels, or
+		// stray cells such as "PHILHEALTH NO." before the actual employee table.
+		// Never use the first partial header match. Instead, score every row and use
+		// the strongest employee-table header candidate.
 		const rowsFromMatrix = matrix => {
-			if (!matrix.length) return { columns: [], rows: [] };
-			// The sheet begins with title/summary rows, so locate the first row that
-			// contains recognized employee columns and ignore everything above it.
-			const headerIndex = matrix.findIndex(row => matchHeaderColumns(row).length > 0);
-			if (headerIndex < 0) return { columns: [], rows: [] };
-			const headerCells = matchHeaderColumns(matrix[headerIndex]);
-			const importedColumns = cleanColumns(headerCells.map(item => item.standard));
-			const seen = new Set();
-			const importedRows = matrix.slice(headerIndex + 1).filter(row => row.some(value => String(value).trim() !== '')).map(row => Object.fromEntries(importedColumns.map((column, index) => [column, row[headerCells[index].index] ?? '']))).filter(row => { const key = JSON.stringify(importedColumns.map(column => cellKey(row[column]))); if (seen.has(key)) return false; seen.add(key); return true; });
-			return { columns: importedColumns, rows: importedRows };
+			if (!Array.isArray(matrix) || !matrix.length) {
+				return { columns: [], rows: [] };
+			}
+
+			const headerCandidates = matrix.map((row, index) => {
+				const matches = matchHeaderColumns(Array.isArray(row) ? row : []);
+				const exactCount = matches.reduce((count, match) => {
+					const original = String(row[match.index] ?? '').trim();
+					return count + (normalizeHeader(original) === normalizeHeader(match.standard) ? 1 : 0);
+				}, 0);
+				const recognized = matches.length;
+				const anchorNames = new Set(['STATUS', 'NEW EMP', 'FULL NAME (Surname, First, Middle)', 'NEW DESIGNATION/POSITION', 'NEW DIVISION/DEPARTMENT', 'HIRING DATE', 'GENDER', 'EMPLOYMENT STATUS', 'PHILHEALTH NO.']);
+				const anchorCount = matches.filter(match => anchorNames.has(match.standard)).length;
+				return { index, row, matches, exactCount, recognized, anchorCount };
+		}).filter(candidate => candidate.recognized > 0);
+
+		if (!headerCandidates.length) {
+			return { columns: [], rows: [] };
+		}
+
+		headerCandidates.sort((a, b) =>
+			b.recognized - a.recognized ||
+			b.exactCount - a.exactCount ||
+			b.anchorCount - a.anchorCount ||
+			a.index - b.index
+		);
+
+		const headerCandidate = headerCandidates[0];
+		const headerIndex = headerCandidate.index;
+		const headerCells = headerCandidate.matches;
+
+		// A real employee header should contain several recognized fields. This
+		// guards against a single stray cell such as "PHILHEALTH NO." being treated
+		// as the entire table header.
+		if (headerCells.length < 3) {
+			return { columns: [], rows: [] };
+		}
+
+		const importedColumns = cleanColumns(
+			headerCells.map(item => item.standard)
+		);
+
+		const isHeaderLikeDataRow = row => {
+			const nonEmpty = (Array.isArray(row) ? row : []).filter(value => String(value ?? '').trim() !== '');
+			if (!nonEmpty.length) return true;
+			const recognized = matchHeaderColumns(row).length;
+			if (recognized >= Math.min(3, headerCells.length)) return true;
+			// Also remove a one-cell repeated label such as "PHILHEALTH NO.".
+			if (nonEmpty.length === 1) {
+				const only = normalizeHeader(nonEmpty[0]);
+				return defaultColumns.some(column => normalizeHeader(column) === only);
+			}
+			return false;
+		};
+
+		const seen = new Set();
+		const importedRows = matrix
+			.slice(headerIndex + 1)
+			.filter(row => !isHeaderLikeDataRow(row))
+			.map(row => Object.fromEntries(
+				importedColumns.map((column, index) => [
+					column,
+					Array.isArray(row) ? (row[headerCells[index].index] ?? '') : ''
+				])
+			))
+			.filter(row => {
+				if (!Object.values(row).some(value => String(value ?? '').trim() !== '')) return false;
+				const key = JSON.stringify(importedColumns.map(column => cellKey(row[column])));
+				if (seen.has(key)) return false;
+				seen.add(key);
+				return true;
+			});
+
+		return { columns: importedColumns, rows: importedRows };
 		};
 		$('reportWeek').value = isoWeekValue(new Date());
 		$('reportMonth').value = new Date().toISOString().slice(0, 7);
